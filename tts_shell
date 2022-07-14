@@ -1,0 +1,145 @@
+#!/usr/bin/python3
+import subprocess, os, sys, re
+import pty
+
+# Ref:
+# https://docs.python.org/3/library/pty.html
+# https://stackoverflow.com/questions/52954248/capture-output-as-a-tty-in-python
+
+# -100: slowest
+# 100: fastest
+SPEECH_RATE = '66'
+SHELL = "sh"
+
+NEWLINE_REGEX = re.compile(r'[\n]+')
+MULTI_SPACE_REGEX = re.compile(r'[ ]{2,}')
+COLOR_ESCAPE_CODE = re.compile(rb'[\033]\[(\d+)(;\d*)?m')
+UPPER_CASE_EXP = re.compile(r'[A-Z]{2,}')
+ISOLATED_CHAR_EXP = re.compile(r"(^|\W)([\'\,\?\;])")
+
+CHAR_NAMES = {
+    ',': "comma",
+    "'": "single quote",
+    "?": "question mark",
+    ";": "semicolon",
+    "(": "left parenthetical",
+    ")": "right parenthetical",
+    " ": "space",
+    "\t": "tab",
+}
+
+
+class TTSShell():
+    no_sleep_proc = None
+    verbose_mode = False
+
+    def __init__(self):
+        self.no_sleep_proc = None
+        self.verbose_mode = False
+        self.shell_cmd = "sh"
+        self.inhibit_sleep = True
+
+    def toggle_verbose_mode(self):
+        if self.verbose_mode:
+            self.say_text(b'Exiting verbose mode.')
+        else:
+            self.say_text(b'Entering verbose mode.')
+        self.verbose_mode = not self.verbose_mode
+
+    def inhibit_lid_sleep(self):
+        # Ref: https://jeff.wintersinger.org/posts/2013/07/how-to-stop-arch-linux-laptop-using-systemd-from-sleeping-when-lid-closed/
+        self.no_sleep_proc = subprocess.Popen(["systemd-inhibit", "--what=handle-lid-switch", "sleep", "10000"])
+
+    def format_for_reading(self, text):
+        text = COLOR_ESCAPE_CODE.sub(b"", text)
+        space_divisor = 1
+        if self.verbose_mode:
+            text = text.decode('utf-8')
+            res = ''
+            for char in text:
+                if 'A' <= char and char <= 'Z':
+                    res += ' Uppercase {}'.format(char)
+                elif '\033' == char or '\x1b' == char:
+                    res += char
+                else:
+                    res += ' {}'.format(char.upper())
+            text = bytes(res, 'utf-8')
+            space_divisor = 2
+
+        def format_spaces(exp):
+            grp = exp.group()
+            spaces = len(grp) // space_divisor
+
+            if spaces == 1:
+                return " space "
+            else:
+                return ", {} spaces, ".format(spaces)
+
+        text = text.replace(b'\x08 \x08', b" backspace ")
+        text = text.replace(b'\x08  \x08', b" backspace ")
+        text = text.replace(b'\033', b' escape ')
+        text = text.decode('utf-8')
+
+        text = MULTI_SPACE_REGEX.sub(format_spaces, text)
+        if not self.verbose_mode:
+            text = UPPER_CASE_EXP.sub(lambda exp: "Uppercase, {}, normcase. ".format(exp.group()), text)
+        text = ISOLATED_CHAR_EXP.sub(
+                lambda exp: "{}, {}, ".format(exp.group(1), CHAR_NAMES[exp.group(2)]),
+                text)
+
+        if text.strip() == "":
+            text = "space"
+        elif text.strip() == "?":
+            text = text.replace('?', 'question mark')
+        elif text.strip() == "'":
+            text = text.replace("'", " Single quote. ")
+        elif text.strip() == ",":
+            text = text.replace(",", " Comma. ")
+
+        text = NEWLINE_REGEX.sub(r' New line. \n', text)
+        text = text.replace('\t', ', tab, ')
+        return bytes(text, 'utf-8')
+
+    def say_text(self, text):
+        if len(text) == 0:
+            return
+
+        cmd = [
+            'spd-say', '-e', '-', '-r', SPEECH_RATE, '-C',
+            '-m', 'most',
+        ]
+
+        # -m: Punctuation mode
+        # -C: Cancel all pending messages
+        # -e -: Read from stdin
+        # -r: Speech rate
+        spd_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        spd_proc.stdin.write(text)
+        spd_proc.stdin.write(b'\n')
+        spd_proc.stdin.flush()
+
+    def read_fd(self, fd):
+        data = os.read(fd, 100 * 1024)
+
+        # Process command keys
+        if data == b'^A':
+            self.say_text(b"Exiting.")
+            exit(1)
+        elif data == b'^B':
+            self.toggle_verbose_mode()
+
+        self.say_text(self.format_for_reading(data))
+        return data
+    def run(self):
+        if self.inhibit_sleep:
+            self.inhibit_lid_sleep()
+        try:
+            os.environ["TERM"] = "dumb"
+            pty.spawn(self.shell_cmd, lambda fd: self.read_fd(fd))
+        finally:
+            self.say_text(b"Exiting.")
+            if self.no_sleep_proc:
+                self.no_sleep_proc.kill()
+
+if __name__ == "__main__":
+    TTSShell().run()
