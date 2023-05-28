@@ -58,37 +58,72 @@ class TTSShell():
 
     def format_for_reading(self, text):
         text = COLOR_ESCAPE_CODE.sub(b"", text)
-        space_divisor = 1
-        if self.verbose_mode:
-            text = text.decode('utf-8')
-            res = ''
-            for char in text:
-                if 'A' <= char and char <= 'Z':
-                    res += ' Uppercase {}'.format(char)
-                elif '\033' == char or '\x1b' == char:
-                    res += char
-                else:
-                    res += ' {}'.format(char.upper())
-            text = bytes(res, 'utf-8')
-            space_divisor = 2
 
         def format_spaces(exp):
             grp = exp.group()
-            spaces = len(grp) // space_divisor
+            spaces = len(grp)
 
             if spaces == 1:
                 return " space "
             else:
-                return ", {} spaces, ".format(spaces)
+                return " then {} spaces, ".format(spaces)
 
-        text = text.replace(b'\x08 \x08', b" backspace ")
-        text = text.replace(b'\x08  \x08', b" backspace ")
+        if self.verbose_mode:
+            text = text.decode('utf-8')
+            res = []
+
+            # Allows a string to be built up, rather than immediately
+            # added to [res]
+            buffer = ''
+
+            # Adds the contents of [buffer] to [res]
+            def flush_buffer():
+                nonlocal buffer
+
+                if len(buffer) == 0:
+                    return
+                res.append(buffer)
+                buffer = ''
+
+            for char in text:
+                if 'A' <= char and char <= 'Z':
+                    flush_buffer()
+                    res.append('Uppercase {},'.format(char))
+                elif '\033' == char or '\x1b' == char:
+                    buffer += char
+                elif ('a' <= char and char <= 'z') or ('0' <= char and '9' >= char):
+                    flush_buffer()
+                    res.append('{},'.format(char.upper()))
+                elif char == ' ' or char == '\t':
+                    buffer += char
+                else:
+                    flush_buffer()
+                    res.append(char)
+
+            flush_buffer()
+
+            res = ' '.join(map(
+                lambda s: MULTI_SPACE_REGEX.sub(format_spaces, s),
+                res
+            ))
+
+            text = bytes(res, 'utf-8')
+
+
+        backspace_patterns = [
+                b'\x08 \x08',
+                b'\x08  \x08',
+                b'\x08   \x08'
+        ]
+        for pattern in backspace_patterns:
+            text = text.replace(pattern, b" backspace ")
+
         text = text.replace(b'\x08', b' backslash x 0 8 ')
         text = text.replace(b'\033', b' escape ')
         text = text.decode('utf-8')
 
-        text = MULTI_SPACE_REGEX.sub(format_spaces, text)
         if not self.verbose_mode:
+            text = MULTI_SPACE_REGEX.sub(format_spaces, text)
             text = UPPER_CASE_EXP.sub(lambda exp: "Uppercase, {}, normcase. ".format(exp.group()), text)
         text = ISOLATED_CHAR_EXP.sub(
                 lambda exp: "{}, {}, ".format(exp.group(1), CHAR_NAMES[exp.group(2)]),
