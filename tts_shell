@@ -1,14 +1,13 @@
 #!/usr/bin/python3
-import subprocess, os, sys, re
+import subprocess, os, sys, re, time
 import pty
+
+# Main repository: https://github.com/personalizedrefrigerator/tts_shell
 
 # Ref:
 # https://docs.python.org/3/library/pty.html
 # https://stackoverflow.com/questions/52954248/capture-output-as-a-tty-in-python
 
-# -100: slowest
-# 100: fastest
-SPEECH_RATE = '66'
 SHELL = "sh"
 
 NEWLINE_REGEX = re.compile(r'[\n]+')
@@ -16,6 +15,8 @@ MULTI_SPACE_REGEX = re.compile(r'[ ]{2,}')
 COLOR_ESCAPE_CODE = re.compile(rb'[\033]\[(\d+)(;\d*)?m')
 UPPER_CASE_EXP = re.compile(r'[A-Z]{2,}')
 ISOLATED_CHAR_EXP = re.compile(r"(^|\W)([\'\,\?\;])")
+
+READ_CHUNK_SIZE = 100 * 1024
 
 CHAR_NAMES = {
     ',': "comma",
@@ -33,11 +34,16 @@ class TTSShell():
     no_sleep_proc = None
     verbose_mode = False
 
+    # -100: slowest
+    # 100: fastest
+    speech_rate = 66
+
     def __init__(self):
         self.no_sleep_proc = None
         self.verbose_mode = False
-        self.shell_cmd = "sh"
+        self.shell_cmd = SHELL
         self.inhibit_sleep = True
+        self.last_say_text_time = 0
 
     def toggle_verbose_mode(self):
         if self.verbose_mode:
@@ -77,6 +83,7 @@ class TTSShell():
 
         text = text.replace(b'\x08 \x08', b" backspace ")
         text = text.replace(b'\x08  \x08', b" backspace ")
+        text = text.replace(b'\x08', b' backslash x 0 8 ')
         text = text.replace(b'\033', b' escape ')
         text = text.decode('utf-8')
 
@@ -90,11 +97,15 @@ class TTSShell():
         if text.strip() == "":
             text = "space"
         elif text.strip() == "?":
-            text = text.replace('?', 'question mark')
+            text = text.replace('?', ' Question mark. ')
+        elif text.strip() == "!":
+            text = text.replace('!', ' Exclamation point. ')
         elif text.strip() == "'":
             text = text.replace("'", " Single quote. ")
         elif text.strip() == ",":
             text = text.replace(",", " Comma. ")
+        elif len(text) == 1 and 'A' <= text[0] and 'Z' >= text[0]:
+            text = text + ' capped'
 
         text = NEWLINE_REGEX.sub(r' New line. \n', text)
         text = text.replace('\t', ', tab, ')
@@ -104,8 +115,17 @@ class TTSShell():
         if len(text) == 0:
             return
 
+        cancel_flag = '-C'
+        now_time = time.time() # seconds
+
+        # If we _just_ said something else, don't cancel speaking.
+        if now_time - self.last_say_text_time < 0.01:
+            cancel_flag = ''
+
+        self.last_say_text_time = time.time()
+
         cmd = [
-            'spd-say', '-e', '-', '-r', SPEECH_RATE, '-C',
+            'spd-say', '-e', '-', '-r', str(self.speech_rate), cancel_flag,
             '-m', 'most',
         ]
 
@@ -118,24 +138,62 @@ class TTSShell():
         spd_proc.stdin.write(b'\n')
         spd_proc.stdin.flush()
 
-    def read_fd(self, fd):
-        data = os.read(fd, 100 * 1024)
-
-        # Process command keys
-        if data == b'^A':
-            self.say_text(b"Exiting.")
-            exit(1)
-        elif data == b'^B':
-            self.toggle_verbose_mode()
+    def read_stdout_fd(self, fd):
+        data = os.read(fd, READ_CHUNK_SIZE)
 
         self.say_text(self.format_for_reading(data))
         return data
+
+    def read_stdin_fd(self, fd):
+        data = os.read(fd, READ_CHUNK_SIZE)
+
+        # True => Backspaces should be written to delete
+        #         user input.
+        delete_input = False
+
+        # Process command keys
+        if data == b'\x01': # Ctrl+A
+            # Exit
+
+            self.say_text(b"Exiting.")
+            exit(1)
+        elif data == b'\x02': # Ctrl+B
+            # Toggle verbosity
+
+            self.toggle_verbose_mode()
+            delete_input = True
+        elif data == b'\x06': # Ctrl+F
+            # Increase the speech rate
+
+            self.speech_rate += 10
+
+            if self.speech_rate > 100:
+                self.speech_rate = -40
+
+            self.say_text(
+                    bytes(
+                        "{} (Speech rate)".format(self.speech_rate),
+                        'ascii'
+                    )
+            )
+
+            delete_input = True
+
+        if delete_input:
+            return b' \x7f' # \x7f=Backspace
+
+        # Data should be read when printed to stdout
+        return data
+
     def run(self):
         if self.inhibit_sleep:
             self.inhibit_lid_sleep()
         try:
             os.environ["TERM"] = "dumb"
-            pty.spawn(self.shell_cmd, lambda fd: self.read_fd(fd))
+            pty.spawn(
+                    self.shell_cmd,
+                    lambda fd: self.read_stdout_fd(fd),
+                    lambda fd: self.read_stdin_fd(fd))
         finally:
             self.say_text(b"Exiting.")
             if self.no_sleep_proc:
