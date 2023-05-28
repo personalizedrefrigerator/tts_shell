@@ -7,3 +7,6 @@ Exit
 
 ## Ctrl+B
 Toggle verbose mode.
+
+## Ctrl+F
+Increase speech rate.
