@@ -2,6 +2,8 @@
 import subprocess, os, sys, re, time
 import pty
 
+from enum import Enum
+
 # Main repository: https://github.com/personalizedrefrigerator/tts_shell
 
 # Ref:
@@ -12,9 +14,12 @@ SHELL = "sh"
 
 NEWLINE_REGEX = re.compile(r'[\n]+')
 MULTI_SPACE_REGEX = re.compile(r'[ ]{2,}')
-COLOR_ESCAPE_CODE = re.compile(rb'[\033]\[(\d+)(;\d*)?m')
+SUPPORTED_ESCAPE_CODE = re.compile(rb'[\033]\[(\d+)(;\d*)?(m|H)')
 UPPER_CASE_EXP = re.compile(r'[A-Z]{2,}')
 ISOLATED_CHAR_EXP = re.compile(r"(^|\W)([\'\,\?\;])")
+
+DEFAULT_PITCH = '0'
+BOLD_PITCH = '-100'
 
 READ_CHUNK_SIZE = 100 * 1024
 
@@ -29,10 +34,14 @@ CHAR_NAMES = {
     "\t": "tab",
 }
 
+class Verbosity(Enum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
 
 class TTSShell():
     no_sleep_proc = None
-    verbose_mode = False
+    verbosity = Verbosity.MEDIUM
 
     # -100: slowest
     # 100: fastest
@@ -40,25 +49,27 @@ class TTSShell():
 
     def __init__(self):
         self.no_sleep_proc = None
-        self.verbose_mode = False
         self.shell_cmd = SHELL
         self.inhibit_sleep = True
         self.last_say_text_time = 0
+        self.pitch = DEFAULT_PITCH
 
     def toggle_verbose_mode(self):
-        if self.verbose_mode:
-            self.say_text(b'Exiting verbose mode.')
+        if self.verbosity == Verbosity.LOW:
+            self.verbosity = Verbosity.MEDIUM
+            self.say_text(b'Medium verbosity.')
+        elif self.verbosity == Verbosity.MEDIUM:
+            self.verbosity = Verbosity.HIGH
+            self.say_text(b'High verbosity.')
         else:
-            self.say_text(b'Entering verbose mode.')
-        self.verbose_mode = not self.verbose_mode
+            self.verbosity = Verbosity.LOW
+            self.say_text(b'Low verbosity.')
 
     def inhibit_lid_sleep(self):
         # Ref: https://jeff.wintersinger.org/posts/2013/07/how-to-stop-arch-linux-laptop-using-systemd-from-sleeping-when-lid-closed/
         self.no_sleep_proc = subprocess.Popen(["systemd-inhibit", "--what=handle-lid-switch", "sleep", "10000"])
 
     def format_for_reading(self, text):
-        text = COLOR_ESCAPE_CODE.sub(b"", text)
-
         def format_spaces(exp):
             grp = exp.group()
             spaces = len(grp)
@@ -68,7 +79,7 @@ class TTSShell():
             else:
                 return " then {} spaces, ".format(spaces)
 
-        if self.verbose_mode:
+        if self.verbosity == Verbosity.HIGH:
             text = text.decode('utf-8')
             res = []
 
@@ -102,27 +113,36 @@ class TTSShell():
 
             flush_buffer()
 
+            def format_group(group):
+                if len(group) > 1:
+                    return MULTI_SPACE_REGEX.sub(format_spaces, group)
+                elif group == ' ':
+                    return 'space'
+                else:
+                    return group
+
             res = ' '.join(map(
-                lambda s: MULTI_SPACE_REGEX.sub(format_spaces, s),
+                format_group,
                 res
             ))
 
             text = bytes(res, 'utf-8')
-
 
         backspace_patterns = [
                 b'\x08 \x08',
                 b'\x08  \x08',
                 b'\x08   \x08'
         ]
-        for pattern in backspace_patterns:
-            text = text.replace(pattern, b" backspace ")
+        if self.verbosity == Verbosity.MEDIUM or self.verbosity == Verbosity.HIGH:
+            for pattern in backspace_patterns:
+                text = text.replace(pattern, b" backspace ")
 
-        text = text.replace(b'\x08', b' backslash x 0 8 ')
-        text = text.replace(b'\033', b' escape ')
+            text = text.replace(b'\x08', b' backslash x 0 8 ')
+            text = text.replace(b'\033', b' escape ')
+
         text = text.decode('utf-8')
 
-        if not self.verbose_mode:
+        if self.verbosity == Verbosity.MEDIUM:
             text = MULTI_SPACE_REGEX.sub(format_spaces, text)
             text = UPPER_CASE_EXP.sub(lambda exp: "Uppercase, {}, normcase. ".format(exp.group()), text)
         text = ISOLATED_CHAR_EXP.sub(
@@ -146,7 +166,7 @@ class TTSShell():
         text = text.replace('\t', ', tab, ')
         return bytes(text, 'utf-8')
 
-    def say_text(self, text):
+    def say_text(self, text: bytes, wait: bool = False):
         if len(text) == 0:
             return
 
@@ -161,7 +181,7 @@ class TTSShell():
 
         cmd = [
             'spd-say', '-e', '-', '-r', str(self.speech_rate), cancel_flag,
-            '-m', 'most',
+            '-m', 'most', '-p', str(self.pitch),
         ]
 
         # -m: Punctuation mode
@@ -173,10 +193,60 @@ class TTSShell():
         spd_proc.stdin.write(b'\n')
         spd_proc.stdin.flush()
 
+        if wait:
+            spd_proc.communicate()
+
+    def preprocess_stdout(self, data: bytes):
+        """
+            Preprocess stdout from the terminal app. (E.g. applying escape codes, etc.)
+        """
+        # Very basic `\e[command m` support
+        last_index = 0
+        for match in SUPPORTED_ESCAPE_CODE.finditer(data):
+            (current_from, current_to) = match.span()
+
+            before_part = data[last_index:current_from]
+            yield before_part
+
+            command_arg = bytes.decode(match.group(1), 'ascii')
+            command_arg2 = match.group(2) and bytes.decode(match.group(2), 'ascii')
+            command_type = match.group(3)
+            last_index = current_to
+
+            if command_arg2:
+                # Remove leading `;`:
+                command_arg2 = command_arg2[1:]
+
+            if command_type == b'H' and command_arg2: # Cursor motion
+                orig_pitch = self.pitch
+                orig_speech_rate = self.speech_rate
+                self.pitch = 100
+
+                # Read "cursor to" very quickly
+                self.speech_rate = 100
+                self.say_text(b'cursor to', wait=True)
+
+                # Read everything else slower
+                self.speech_rate = max(orig_speech_rate, 60)
+                cursor_loc = bytes('row {} col {}'.format(command_arg, command_arg2), 'ascii')
+                self.say_text(cursor_loc, wait=True)
+
+                self.pitch = orig_pitch
+                self.speech_rate = orig_speech_rate
+            elif command_type == b'm':
+                if command_arg == '0': # Reset
+                    self.pitch = DEFAULT_PITCH
+                elif command_arg == '01': # Bold
+                    self.pitch = BOLD_PITCH
+
+        yield data[last_index:]
+
     def read_stdout_fd(self, fd):
         data = os.read(fd, READ_CHUNK_SIZE)
 
-        self.say_text(self.format_for_reading(data))
+        for chunk in self.preprocess_stdout(data):
+            self.say_text(self.format_for_reading(chunk), wait=True)
+
         return data
 
     def read_stdin_fd(self, fd):
@@ -212,6 +282,20 @@ class TTSShell():
                     )
             )
 
+            delete_input = True
+        elif data == b'\x08': # Ctrl+H
+            # Help
+            self.say_text(bytes(
+                '\n\n'.join([
+                    'tts_shell help',
+                    '',
+                    'Shortcut: ctrl plus A: Exit.',
+                    'Shortcut: Ctrl plus B: Change verbosity.',
+                    'Shortcut: Ctrl plus F: Change speech rate.',
+                    'Shortcut: Ctrl plus H: Help.',
+                ]),
+                'ascii'
+            ))
             delete_input = True
 
         if delete_input:
