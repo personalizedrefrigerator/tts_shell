@@ -218,21 +218,22 @@ class TTSShell():
                 command_arg2 = command_arg2[1:]
 
             if command_type == b'H' and command_arg2: # Cursor motion
-                orig_pitch = self.pitch
-                orig_speech_rate = self.speech_rate
-                self.pitch = 100
+                if self.verbosity == Verbosity.MEDIUM or self.verbosity == Verbosity.HIGH:
+                    orig_pitch = self.pitch
+                    orig_speech_rate = self.speech_rate
+                    self.pitch = 100
 
-                # Read "cursor to" very quickly
-                self.speech_rate = 100
-                self.say_text(b'cursor to', wait=True)
+                    # Read "cursor to" very quickly
+                    self.speech_rate = 100
+                    self.say_text(b'cursor to', wait=True)
 
-                # Read everything else slower
-                self.speech_rate = max(orig_speech_rate, 60)
-                cursor_loc = bytes('row {} col {}'.format(command_arg, command_arg2), 'ascii')
-                self.say_text(cursor_loc, wait=True)
+                    # Read everything else slower
+                    self.speech_rate = max(orig_speech_rate, 60)
+                    cursor_loc = bytes('row {} col {}'.format(command_arg, command_arg2), 'ascii')
+                    self.say_text(cursor_loc, wait=True)
 
-                self.pitch = orig_pitch
-                self.speech_rate = orig_speech_rate
+                    self.pitch = orig_pitch
+                    self.speech_rate = orig_speech_rate
             elif command_type == b'm':
                 if command_arg == '0': # Reset
                     self.pitch = DEFAULT_PITCH
